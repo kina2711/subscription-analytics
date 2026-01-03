@@ -16,7 +16,6 @@ st.set_page_config(
 DATA_URL = "https://docs.google.com/spreadsheets/d/14h1dp9hV7V2aEx17jX7ubf8_j3K6c_oP_rK6L0t7Bh8/export?format=csv&gid=1004861213"
 
 # 2. HÀM HỖ TRỢ & XỬ LÝ DỮ LIỆU (ETL)
-
 @st.cache_data(ttl=600)
 def load_data():
     """Load dữ liệu trực tiếp từ Google Sheet."""
@@ -49,7 +48,6 @@ def parse_duration(product_str):
     if 'học thử' in p_lower: return 1
 
     return 0
-
 
 def clean_currency(x):
     """Làm sạch chuỗi tiền tệ thành số float."""
@@ -110,7 +108,8 @@ def process_financial_data(df):
             temp_df = pd.DataFrame({
                 'Date': date_range,
                 'Daily_Revenue': row['Daily_Rate'],
-                'Customer_ID': row.get('Mã khách hàng', 'Unknown'),
+                'Mã khách hàng': row.get('Mã khách hàng', 'Unknown'),
+                # FIX: Giữ nguyên tên tiếng Việt để khớp với calculate_cohorts
                 'Product': row[col_product]
             })
             daily_records.append(temp_df)
@@ -121,7 +120,7 @@ def process_financial_data(df):
     if daily_records:
         daily_revenue_df = pd.concat(daily_records, ignore_index=True)
     else:
-        daily_revenue_df = pd.DataFrame(columns=['Date', 'Daily_Revenue', 'Customer_ID', 'Product'])
+        daily_revenue_df = pd.DataFrame(columns=['Date', 'Daily_Revenue', 'Mã khách hàng', 'Product'])
 
     return df_clean, daily_revenue_df
 
@@ -135,11 +134,13 @@ def calculate_cohorts(df_clean, daily_revenue_df):
     daily_revenue_df['Date'] = pd.to_datetime(daily_revenue_df['Date'])
 
     # 1. Xác định tháng gia nhập (Acquisition Month)
+    # Lấy min ngày thanh toán của từng khách hàng
     df_clean['Acquisition_Month'] = df_clean.groupby('Mã khách hàng')['Ngày thanh toán'].transform('min').dt.to_period(
         'M')
+
     cohort_map = df_clean[['Mã khách hàng', 'Acquisition_Month']].drop_duplicates()
 
-    # 2. Xác định tháng hoạt động (Activity Month) - Dựa trên việc "còn hạn sử dụng" trong ngày đó
+    # 2. Xác định tháng hoạt động (Activity Month) 
     daily_revenue_df['Activity_Month'] = daily_revenue_df['Date'].dt.to_period('M')
     active_customers = daily_revenue_df[['Mã khách hàng', 'Activity_Month']].drop_duplicates()
 
@@ -164,7 +165,6 @@ def calculate_cohorts(df_clean, daily_revenue_df):
     return retention_matrix, cohort_size
 
 # 3. GIAO DIỆN DASHBOARD (MAIN)
-
 def main():
     st.title("Subscription Analytics & Financial Dashboard")
     st.markdown("### Bài giải Technical Test - Vị trí Data Analyst")
@@ -192,8 +192,8 @@ def main():
     # Tính Monthly Stats cho biểu đồ
     monthly_stats = daily_df.groupby(daily_df['Date'].dt.to_period('M')).agg({
         'Daily_Revenue': 'sum',
-        'Customer_ID': 'nunique'
-    }).rename(columns={'Daily_Revenue': 'Accrual_Revenue', 'Customer_ID': 'Active_Users'}).reset_index()
+        'Mã khách hàng': 'nunique'
+    }).rename(columns={'Daily_Revenue': 'Accrual_Revenue', 'Mã khách hàng': 'Active_Users'}).reset_index()
 
     monthly_stats.rename(columns={'Date': 'Month_Period'}, inplace=True)
     monthly_stats['Month_Str'] = monthly_stats['Month_Period'].astype(str)
@@ -206,7 +206,8 @@ def main():
     current_month_rev = monthly_stats.iloc[-1]['Accrual_Revenue'] if not monthly_stats.empty else 0
 
     max_date = daily_df['Date'].max()
-    active_now = daily_df[daily_df['Date'] == max_date]['Customer_ID'].nunique()
+    # FIX: Sửa Customer_ID thành Mã khách hàng
+    active_now = daily_df[daily_df['Date'] == max_date]['Mã khách hàng'].nunique()
 
     col1.metric("Tổng Accrual Revenue", f"{total_rev_accrual:,.0f} VND")
     col2.metric("Revenue Tháng Gần Nhất", f"{current_month_rev:,.0f} VND")
@@ -291,7 +292,6 @@ def main():
     with tab3:
         st.subheader("Dữ liệu gốc (đã làm sạch)")
         st.dataframe(df_clean)
-
 
 if __name__ == "__main__":
     main()
