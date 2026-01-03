@@ -12,17 +12,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Link Google Sheet
+# Link Google Sheet (dạng CSV export)
 DATA_URL = "https://docs.google.com/spreadsheets/d/14h1dp9hV7V2aEx17jX7ubf8_j3K6c_oP_rK6L0t7Bh8/export?format=csv&gid=1004861213"
 
-# 2. HÀM XỬ LÝ DỮ LIỆU (ETL)
+# 2. HÀM HỖ TRỢ & XỬ LÝ DỮ LIỆU (ETL)
 
 @st.cache_data(ttl=600)
 def load_data():
     """Load dữ liệu trực tiếp từ Google Sheet."""
     try:
         df = pd.read_csv(DATA_URL)
-        # Chuẩn hóa tên cột để tránh lỗi typo/space
+        # Chuẩn hóa tên cột: xóa khoảng trắng thừa ở đầu/cuối tên cột
         df.columns = [c.strip() for c in df.columns]
         return df
     except Exception as e:
@@ -30,8 +30,11 @@ def load_data():
         return pd.DataFrame()
 
 def parse_duration(product_str):
-    """Phân tích tên sản phẩm để lấy số ngày (Duration)."""
-    if pd.isna(product_str): return 30
+    """
+    Phân tích tên sản phẩm để lấy số ngày (Duration).
+    Mặc định là 0 ngày nếu không tìm thấy từ khóa.
+    """
+    if pd.isna(product_str): return 0
 
     p_lower = str(product_str).lower()
 
@@ -43,60 +46,76 @@ def parse_duration(product_str):
     if '01 tháng' in p_lower or '1 tháng' in p_lower: return 30
     if '2 tuần' in p_lower: return 14
     if '1 tuần' in p_lower: return 7
-    if 'học thử' in p_lower: return 30
+    if 'học thử' in p_lower: return 1
 
-    return 1  # Default nếu không tìm thấy pattern
+    return 0
+
+
+def clean_currency(x):
+    """Làm sạch chuỗi tiền tệ thành số float."""
+    try:
+        # Xóa dấu phẩy, dấu chấm, ký tự tiền tệ
+        clean_str = str(x).replace(',', '').replace('.', '').replace('₫', '').replace('VNĐ', '').strip()
+        return float(clean_str)
+    except:
+        return 0.0
 
 @st.cache_data
 def process_financial_data(df):
-    """Xử lý làm sạch và tính toán Accrual Revenue (Doanh thu dồn tích)."""
-    # Create a copy
+    """
+    Xử lý làm sạch và tính toán Accrual Revenue (Doanh thu dồn tích).
+    """
+    # Copy để tránh warning SettingWithCopy
     df_clean = df.copy()
 
-    # 1. Làm sạch ngày tháng
+    # 1. XỬ LÝ NGÀY THÁNG
     if 'Ngày thanh toán' not in df_clean.columns:
-        st.error("Dữ liệu thiếu cột 'Ngày thanh toán'")
         return pd.DataFrame(), pd.DataFrame()
 
-    df_clean['Ngày thanh toán'] = pd.to_datetime(df_clean['Ngày thanh toán'], format='%d/%m/%y', errors='coerce')
+    # Chuyển đổi ngày tháng: dayfirst=True ưu tiên định dạng dd/mm/yyyy (Việt Nam)
+    df_clean['Ngày thanh toán'] = pd.to_datetime(df_clean['Ngày thanh toán'], dayfirst=True, errors='coerce')
 
-    # Loại bỏ đơn chưa thanh toán hoặc lỗi ngày
+    # Loại bỏ các dòng mà ngày thanh toán bị lỗi (NaT)
     df_clean = df_clean.dropna(subset=['Ngày thanh toán'])
 
-    # 2. Parse thời gian và tính Daily Rate
-    col_product = 'Sản phẩm' if 'Sản phẩm' in df_clean.columns else df_clean.columns[1]  # Fallback logic
-    col_amount = 'Đã thanh toán' if 'Đã thanh toán' in df_clean.columns else df_clean.columns[2]  # Fallback logic
+    if df_clean.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
+    # 2. TỰ ĐỘNG NHẬN DIỆN CỘT
+    # Xác định cột Tiền
+    col_amount = 'Đã thanh toán'
+    if 'Đã thanh toán' not in df_clean.columns:
+        col_amount = df_clean.columns[2]  # Fallback
+
+    # Xác định cột Sản phẩm
+    col_product = 'Sản phẩm' if 'Sản phẩm' in df_clean.columns else df_clean.columns[1]
+
+    # 3. TÍNH TOÁN DURATION & DAILY RATE
     df_clean['Duration'] = df_clean[col_product].apply(parse_duration)
-
-    # Xử lý chuỗi tiền tệ
-    def clean_currency(x):
-        try:
-            return float(str(x).replace(',', '').replace('.', '').replace('₫', '').strip())
-        except:
-            return 0.0
-
     df_clean['Amount_Clean'] = df_clean[col_amount].apply(clean_currency)
 
     # Tính giá trị mỗi ngày (Daily Rate)
     df_clean['Daily_Rate'] = df_clean['Amount_Clean'] / df_clean['Duration']
 
-    # 3. Kỹ thuật "Explode" để tạo bảng doanh thu theo ngày (Daily Ledger)
-    daily_records = []  # Fix: Initialize list
+    # 4. EXPLODE RA DAILY LEDGER (SỔ CÁI HÀNG NGÀY)
+    daily_records = []
 
     for _, row in df_clean.iterrows():
-        # Tạo dải ngày từ ngày thanh toán đến hết hạn
-        # Fix: periods must be integer
-        date_range = pd.date_range(start=row['Ngày thanh toán'], periods=int(row['Duration']), freq='D')
+        try:
+            duration = int(row['Duration'])
+            # Tạo dải ngày từ ngày thanh toán đến hết hạn
+            date_range = pd.date_range(start=row['Ngày thanh toán'], periods=duration, freq='D')
 
-        # DataFrame nhỏ cho từng đơn hàng
-        temp_df = pd.DataFrame({
-            'Date': date_range,
-            'Daily_Revenue': row['Daily_Rate'],  # Fix: Use calculated rate
-            'Customer_ID': row['Mã khách hàng'],
-            'Product': row[col_product]
-        })
-        daily_records.append(temp_df)
+            # Tạo DataFrame con cho từng đơn hàng
+            temp_df = pd.DataFrame({
+                'Date': date_range,
+                'Daily_Revenue': row['Daily_Rate'],
+                'Customer_ID': row.get('Mã khách hàng', 'Unknown'),
+                'Product': row[col_product]
+            })
+            daily_records.append(temp_df)
+        except Exception:
+            continue
 
     # Gộp tất cả lại thành một bảng master
     if daily_records:
@@ -112,39 +131,39 @@ def calculate_cohorts(df_clean, daily_revenue_df):
     if daily_revenue_df.empty:
         return pd.DataFrame(), pd.Series()
 
-    # Ensure Date format
+    # Đảm bảo cột Date là datetime
     daily_revenue_df['Date'] = pd.to_datetime(daily_revenue_df['Date'])
 
     # 1. Xác định tháng gia nhập (Acquisition Month)
-    df_clean['Acquisition_Month'] = df_clean.groupby('Mã khách hàng')['Ngày thanh toán'].transform('min').dt.to_period('M')
+    df_clean['Acquisition_Month'] = df_clean.groupby('Mã khách hàng')['Ngày thanh toán'].transform('min').dt.to_period(
+        'M')
     cohort_map = df_clean[['Mã khách hàng', 'Acquisition_Month']].drop_duplicates()
 
-    # 2. Xác định tháng hoạt động (Activity Month)
-    # Fix: use .dt on the column 'Date', not the dataframe
+    # 2. Xác định tháng hoạt động (Activity Month) - Dựa trên việc "còn hạn sử dụng" trong ngày đó
     daily_revenue_df['Activity_Month'] = daily_revenue_df['Date'].dt.to_period('M')
     active_customers = daily_revenue_df[['Mã khách hàng', 'Activity_Month']].drop_duplicates()
 
     # 3. Join lại
     cohort_data = pd.merge(active_customers, cohort_map, on='Mã khách hàng')
 
-    # 4. Tính Cohort Index
+    # 4. Tính Cohort Index (Khoảng cách tháng)
     def diff_months(x):
-        return (x['Activity_Month'].year - x['Acquisition_Month'].year) * 12 + (x['Activity_Month'].month - x['Acquisition_Month'].month)
+        return (x['Activity_Month'].year - x['Acquisition_Month'].year) * 12 + \
+            (x['Activity_Month'].month - x['Acquisition_Month'].month)
 
     cohort_data['Cohort_Index'] = cohort_data.apply(diff_months, axis=1)
 
-    # 5. Pivot Table
+    # 5. Pivot Table đếm số lượng user
     cohort_counts = cohort_data.groupby(['Acquisition_Month', 'Cohort_Index'])['Mã khách hàng'].nunique().reset_index()
     cohort_pivot = cohort_counts.pivot(index='Acquisition_Month', columns='Cohort_Index', values='Mã khách hàng')
 
-    # 6. Tính Retention Rate
+    # 6. Tính Retention Rate (%)
     cohort_size = cohort_pivot.iloc[:, 0]
     retention_matrix = cohort_pivot.divide(cohort_size, axis=0)
 
     return retention_matrix, cohort_size
 
-
-# 3. GIAO DIỆN DASHBOARD
+# 3. GIAO DIỆN DASHBOARD (MAIN)
 
 def main():
     st.title("Subscription Analytics & Financial Dashboard")
@@ -156,25 +175,26 @@ def main():
         raw_df = load_data()
 
     if raw_df.empty:
-        st.warning("Không thể tải dữ liệu hoặc dữ liệu trống. Vui lòng kiểm tra lại đường truyền.")
+        st.error("Không thể tải dữ liệu. Vui lòng kiểm tra lại đường truyền.")
         return
 
     # Process Data
     df_clean, daily_df = process_financial_data(raw_df)
 
+    # Validation
     if daily_df.empty:
-        st.warning("Dữ liệu sau khi xử lý bị trống. Kiểm tra lại định dạng ngày tháng hoặc tên cột.")
-        st.write("Columns found:", raw_df.columns.tolist())
-        return
+        st.error("Dữ liệu sau khi xử lý bị trống!")
+        st.warning(f"Hệ thống tìm thấy các cột: {raw_df.columns.tolist()}")
+        st.info(
+            "Vui lòng kiểm tra lại định dạng ngày tháng trong file Google Sheet (nên là dd/mm/yyyy hoặc yyyy-mm-dd) và cột Tiền.")
+        st.stop()
 
-    # Tính Monthly Stats
-    # Fix: Use 'Date' column for period conversion
+    # Tính Monthly Stats cho biểu đồ
     monthly_stats = daily_df.groupby(daily_df['Date'].dt.to_period('M')).agg({
         'Daily_Revenue': 'sum',
         'Customer_ID': 'nunique'
     }).rename(columns={'Daily_Revenue': 'Accrual_Revenue', 'Customer_ID': 'Active_Users'}).reset_index()
 
-    # Rename 'Date' back to something display friendly but keep type for plotting
     monthly_stats.rename(columns={'Date': 'Month_Period'}, inplace=True)
     monthly_stats['Month_Str'] = monthly_stats['Month_Period'].astype(str)
 
@@ -185,25 +205,26 @@ def main():
     avg_mau = monthly_stats['Active_Users'].mean()
     current_month_rev = monthly_stats.iloc[-1]['Accrual_Revenue'] if not monthly_stats.empty else 0
 
-    # Fix: Logic for active now
     max_date = daily_df['Date'].max()
     active_now = daily_df[daily_df['Date'] == max_date]['Customer_ID'].nunique()
 
     col1.metric("Tổng Accrual Revenue", f"{total_rev_accrual:,.0f} VND")
     col2.metric("Revenue Tháng Gần Nhất", f"{current_month_rev:,.0f} VND")
-    col3.metric("Avg. Monthly Active Users", f"{int(avg_mau)}")
+    col3.metric("Avg. Monthly Active Users", f"{int(avg_mau) if not pd.isna(avg_mau) else 0}")
     col4.metric("Active Users Hiện Tại", f"{active_now}")
 
     st.markdown("---")
 
-    # TAB 1: DOANH THU & TĂNG TRƯỞNG
+    # TABS SECTION
     tab1, tab2, tab3 = st.tabs(["Doanh Thu & Users", "Cohort Retention", "Dữ liệu Chi tiết"])
 
+    # TAB 1: DOANH THU
     with tab1:
         st.subheader("Diễn biến Doanh thu Dồn tích (Accrual Revenue)")
-        st.caption("Doanh thu được ghi nhận dựa trên số ngày thực tế sử dụng dịch vụ.")
+        st.caption(
+            "Doanh thu được ghi nhận rải đều theo số ngày sử dụng dịch vụ thực tế, phản ánh chính xác hiệu quả kinh doanh hơn Cash-based.")
 
-        # Biểu đồ Line kết hợp Bar
+        # Biểu đồ Combo: Bar (Revenue) + Line (Users)
         fig_rev = go.Figure()
         fig_rev.add_trace(go.Bar(
             x=monthly_stats['Month_Str'],
@@ -231,47 +252,44 @@ def main():
 
     # TAB 2: COHORT ANALYSIS
     with tab2:
-        st.subheader("Phân Tích Cohort Retention (Activity-Based)")
-        st.caption("Tỷ lệ % khách hàng vẫn còn Active sau các tháng kể từ khi gia nhập.")
+        st.subheader("Phân Tích Cohort Retention")
+        st.caption("Tỷ lệ % khách hàng tiếp tục sử dụng dịch vụ (Retention) qua các tháng kể từ khi gia nhập.")
 
         retention_matrix, cohort_size = calculate_cohorts(df_clean, daily_df)
 
         if not retention_matrix.empty:
-            # Format lại index cho đẹp
+            # Chuyển index thành string để hiển thị đẹp
             retention_matrix.index = retention_matrix.index.astype(str)
 
-            # Vẽ Heatmap
+            # Chuẩn bị dữ liệu vẽ Heatmap
             z = retention_matrix.values * 100
             x = retention_matrix.columns.astype(str)
             y = retention_matrix.index.tolist()
 
-            # Annotation text
+            # Tạo text hiển thị trên từng ô
             text_data = [[f"{val:.1f}%" if not pd.isna(val) else "" for val in row] for row in z]
 
             fig_cohort = go.Figure(data=go.Heatmap(
                 z=z, x=x, y=y,
-                text=text_data,
-                texttemplate="%{text}",
-                colorscale='Blues',
-                hoverongaps=False,
-                showscale=True
+                text=text_data, texttemplate="%{text}",
+                colorscale='Blues', hoverongaps=False
             ))
 
             fig_cohort.update_layout(
-                xaxis_title="Số tháng kể từ khi mua lần đầu (Month Index)",
-                yaxis_title="Tháng Gia Nhập (Cohort Month)",
-                height=700
+                xaxis_title="Tháng thứ n (kể từ khi mua lần đầu)",
+                yaxis_title="Tháng Gia Nhập (Cohort)",
+                height=600
             )
             st.plotly_chart(fig_cohort, use_container_width=True)
 
-            with st.expander("Xem bảng số liệu Cohort Size"):
+            with st.expander("Xem chi tiết số lượng khách hàng (Cohort Size)"):
                 st.dataframe(cohort_size.reset_index().rename(columns={0: 'Cohort Size'}))
         else:
-            st.info("Chưa đủ dữ liệu để vẽ Cohort.")
+            st.info("Chưa đủ dữ liệu để vẽ biểu đồ Cohort.")
 
     # TAB 3: DATA PREVIEW
     with tab3:
-        st.subheader("Dữ liệu sau khi làm sạch (Silver Layer)")
+        st.subheader("Dữ liệu gốc (đã làm sạch)")
         st.dataframe(df_clean)
 
 
