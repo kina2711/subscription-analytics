@@ -59,31 +59,26 @@ Xây dựng pipeline xử lý dữ liệu tự động để:
 
 ## 4. How to Run Locallybash
 
-# 1. Clone repo
+### 4.1. Clone repo
 
 git clone
 
-# 2. Install dependencies
+### 4.2. Install dependencies
 
 pip install -r requirements.txt
 
-# 3. Run app
-
+### 4.3. Run app
+```
 streamlit run app.py
-
 ```
 
 ## 5. Project Structure
 ```
-
 ├── app.py # Main application logic
 
 ├── requirements.txt # Dependencies
 
 └── README.md # Documentation
-
 ```
-
 ---
 *Author: KIEN THAI TRUNG - Data Analyst*
-```
